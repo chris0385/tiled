@@ -1,6 +1,7 @@
 /*
  * createpolygonobjecttool.cpp
  * Copyright 2014, Martin Ziel <martin.ziel.com>
+ * Copyright 2015-2018, Thorbjørn Lindeijer <bjorn@lindeijer.nl>
  *
  * This file is part of Tiled.
  *
@@ -20,20 +21,122 @@
 
 #include "createpolygonobjecttool.h"
 
+#include "addremovemapobject.h"
+#include "changemapobject.h"
+#include "changepolygon.h"
+#include "editpolygontool.h"
+#include "geometry.h"
+#include "mapdocument.h"
 #include "mapobject.h"
 #include "mapobjectitem.h"
+#include "maprenderer.h"
+#include "mapscene.h"
+#include "objectgroup.h"
+#include "pointhandle.h"
+#include "snaphelper.h"
+#include "toolmanager.h"
 #include "utils.h"
+
+#include <QApplication>
+#include <QGraphicsView>
+#include <QPalette>
+#include <QUndoStack>
 
 using namespace Tiled;
 using namespace Tiled::Internal;
 
 CreatePolygonObjectTool::CreatePolygonObjectTool(QObject *parent)
-    : CreateMultipointObjectTool(parent)
+    : CreateObjectTool(parent)
+    , mOverlayPolygonObject(new MapObject)
+    , mOverlayObjectGroup(new ObjectGroup)
+    , mOverlayPolygonItem(nullptr)
+    , mMode(NoMode)
+    , mFinishAsPolygon(false)
 {
+    mOverlayObjectGroup->addObject(mOverlayPolygonObject);
+
+    QColor highlight = QApplication::palette().highlight().color();
+    mOverlayObjectGroup->setColor(highlight);
+
     QIcon icon(QLatin1String(":images/24x24/insert-polygon.png"));
     icon.addFile(QLatin1String(":images/48x48/insert-polygon.png"));
     setIcon(icon);
+
     languageChanged();
+}
+
+CreatePolygonObjectTool::~CreatePolygonObjectTool()
+{
+    delete mOverlayObjectGroup;
+}
+
+void CreatePolygonObjectTool::activate(MapScene *scene)
+{
+    CreateObjectTool::activate(scene);
+
+    updateHandles();
+
+    // TODO: Could be more optimal by separating the updating of handles from
+    // the creation and removal of handles depending on changes in the
+    // selection, and by only updating the handles of the objects that changed.
+    connect(mapDocument(), &MapDocument::objectsChanged,
+            this, &CreatePolygonObjectTool::objectsChanged);
+    connect(mapDocument(), &MapDocument::selectedObjectsChanged,
+            this, &CreatePolygonObjectTool::updateHandles);
+    connect(mapDocument(), &MapDocument::objectsRemoved,
+            this, &CreatePolygonObjectTool::objectsRemoved);
+}
+
+void CreatePolygonObjectTool::deactivate(MapScene *scene)
+{
+    if (mMode == ExtendingAtBegin || mMode == ExtendingAtEnd)
+        finishExtendingMapObject();
+
+    disconnect(mapDocument(), &MapDocument::objectsChanged,
+               this, &CreatePolygonObjectTool::updateHandles);
+    disconnect(mapDocument(), &MapDocument::selectedObjectsChanged,
+               this, &CreatePolygonObjectTool::updateHandles);
+    disconnect(mapDocument(), &MapDocument::objectsRemoved,
+               this, &CreatePolygonObjectTool::objectsRemoved);
+
+    qDeleteAll(mHandles);
+    mHandles.clear();
+
+    mHoveredHandle = nullptr;
+    mClickedHandle = nullptr;
+
+    CreateObjectTool::deactivate(scene);
+}
+
+void CreatePolygonObjectTool::keyPressed(QKeyEvent *event)
+{
+    // todo: Backspace for going back one step (and possibly override undo shortcut)
+    // todo: Modifier for finishing as polygon (Shift+Enter)
+    CreateObjectTool::keyPressed(event);
+}
+
+void CreatePolygonObjectTool::mouseMoved(const QPointF &pos, Qt::KeyboardModifiers modifiers)
+{
+    updateHover(pos);
+    CreateObjectTool::mouseMoved(pos, modifiers);
+}
+
+void CreatePolygonObjectTool::mousePressed(QGraphicsSceneMouseEvent *event)
+{
+    updateHover(event->scenePos(), event);
+
+    mClickedHandle = mHoveredHandle;
+
+    if (event->button() == Qt::LeftButton) {
+        if (mMode == NoMode && mClickedHandle) {
+            // Pressing on a handle starts extending the polyline at that side
+            bool extendingFirst = mClickedHandle->pointIndex() == 0;
+            extend(mClickedHandle->mapObject(), extendingFirst);
+            return;
+        }
+    }
+
+    CreateObjectTool::mousePressed(event);
 }
 
 void CreatePolygonObjectTool::languageChanged()
@@ -42,17 +145,373 @@ void CreatePolygonObjectTool::languageChanged()
     setShortcut(QKeySequence(tr("P")));
 }
 
+void CreatePolygonObjectTool::mouseMovedWhileCreatingObject(const QPointF &pos,
+                                                            Qt::KeyboardModifiers modifiers)
+{
+    const MapRenderer *renderer = mapDocument()->renderer();
+
+    QPointF screenPos = pos;
+
+    if (mHoveredHandle) {
+        MapObject *object = mHoveredHandle->mapObject();
+        int pointIndex = mHoveredHandle->pointIndex();
+
+        QPointF objectScreenPos = renderer->pixelToScreenCoords(object->position());
+        QTransform rotate = rotateAt(objectScreenPos, object->rotation());
+        QPointF totalOffset = object->objectGroup()->totalOffset();
+
+        QPointF pixelPos = object->polygon().at(pointIndex) + object->position();
+        screenPos = totalOffset + rotate.map(renderer->pixelToScreenCoords(pixelPos));
+    }
+
+    QPointF pixelCoords = renderer->screenToPixelCoords(screenPos);
+    SnapHelper(renderer, modifiers).snap(pixelCoords);
+
+    mLastPixelPos = pixelCoords;
+    pixelCoords -= mNewMapObjectItem->mapObject()->position();
+
+    QPolygonF polygon = mOverlayPolygonObject->polygon();
+
+    if (mMode == ExtendingAtBegin)
+        polygon.first() = pixelCoords;
+    else
+        polygon.last() = pixelCoords;
+
+    MapObject::Shape shape = MapObject::Polyline;
+    if (mHoveredHandle && mHoveredHandle->mapObject() == mNewMapObjectItem->mapObject())
+        shape = MapObject::Polygon;
+
+    mOverlayPolygonItem->mapObject()->setShape(shape);
+    mOverlayPolygonItem->setPolygon(polygon);
+}
+
+void CreatePolygonObjectTool::mousePressedWhileCreatingObject(QGraphicsSceneMouseEvent *event)
+{
+    if (event->button() == Qt::RightButton) {
+        finishNewMapObject();
+    } else if (event->button() == Qt::LeftButton) {
+        if (mClickedHandle) {
+            if (mClickedHandle->mapObject() == mNewMapObjectItem->mapObject()) {
+                mFinishAsPolygon = true;
+                finishNewMapObject();
+                return;
+            } else {
+                // todo: Handle of some other polyline was pressed: connect to it, creating a single polyline object
+                MapObject *otherObject = mClickedHandle->mapObject();
+                QPolygonF otherPolygon = otherObject->polygon().translated(otherObject->position() - mNewMapObjectItem->mapObject()->position());
+                QPolygonF polygon = mNewMapObjectItem->mapObject()->polygon();
+
+                //bool otherAtEnd = mClickedHandle->pointIndex() == otherPolygon.size() - 1;
+                // todo: handle other cases than connecting end to start
+
+                polygon += otherPolygon;
+
+                mapDocument()->undoStack()->beginMacro(tr("Connect Polylines"));
+
+                if (mMode == Creating) {
+                    mNewMapObjectItem->setPolygon(polygon);
+                    finishNewMapObject();
+                } else {
+                    mapDocument()->undoStack()->push(new ChangePolygon(mapDocument(),
+                                                                       mNewMapObjectItem->mapObject(),
+                                                                       polygon, mNewMapObjectItem->mapObject()->polygon()));
+                    finishExtendingMapObject();
+                }
+
+                mapDocument()->undoStack()->push(new RemoveMapObject(mapDocument(), otherObject));
+                mapDocument()->undoStack()->endMacro();
+
+                return;
+            }
+        }
+
+        QPolygonF current = mNewMapObjectItem->mapObject()->polygon();
+        QPolygonF next = mOverlayPolygonObject->polygon();
+
+        // Ignore press when the mouse is still in the same place
+        if (mMode == ExtendingAtBegin) {
+            if (next.first() == current.first())
+                return;
+        } else {
+            if (next.last() == current.last())
+                return;
+        }
+
+        // Assign current overlay polygon to the new object
+        if (mMode == Creating) {
+            mNewMapObjectItem->setPolygon(next);
+
+            // Check if we reached the size at which we could close as polygon
+            if (next.size() > 2)
+                updateHandles();
+        } else {
+            mapDocument()->undoStack()->push(new ChangePolygon(mapDocument(),
+                                                               mNewMapObjectItem->mapObject(),
+                                                               next, current));
+        }
+
+        // Add a new editable point to the overlay
+        if (mMode == ExtendingAtBegin)
+            next.prepend(next.first());
+        else
+            next.append(next.last());
+
+        mOverlayPolygonItem->setPolygon(next);
+    }
+}
+
 MapObject *CreatePolygonObjectTool::createNewMapObject()
 {
     MapObject *newMapObject = new MapObject;
-    newMapObject->setShape(MapObject::Polygon);
+    newMapObject->setShape(MapObject::Polyline);
     return newMapObject;
+}
+
+void CreatePolygonObjectTool::cancelNewMapObject()
+{
+    if (mMode != Creating)
+        finishExtendingMapObject();
+    else
+        CreateObjectTool::cancelNewMapObject();
 }
 
 void CreatePolygonObjectTool::finishNewMapObject()
 {
-    if (mNewMapObjectItem->mapObject()->polygon().size() >= 3)
-        CreateMultipointObjectTool::finishNewMapObject();
+    if (mNewMapObjectItem->mapObject()->polygon().size() < 2) {
+        CreatePolygonObjectTool::cancelNewMapObject();
+        return;
+    }
+
+    if (mMode != Creating) {
+        finishExtendingMapObject();
+    } else {
+        if (mFinishAsPolygon)
+            mNewMapObjectItem->mapObject()->setShape(MapObject::Polygon);
+
+        CreateObjectTool::finishNewMapObject();
+    }
+}
+
+MapObject *CreatePolygonObjectTool::clearNewMapObjectItem()
+{
+    delete mOverlayPolygonItem;
+    mOverlayPolygonItem = nullptr;
+
+    mMode = NoMode;
+    mFinishAsPolygon = false;
+
+    return CreateObjectTool::clearNewMapObjectItem();
+}
+
+static QTransform viewTransform(QGraphicsSceneMouseEvent *event)
+{
+    if (QWidget *widget = event->widget())
+        if (QGraphicsView *view = static_cast<QGraphicsView*>(widget->parent()))
+            return view->transform();
+    return QTransform();
+}
+
+void CreatePolygonObjectTool::updateHover(const QPointF &scenePos, QGraphicsSceneMouseEvent *event)
+{
+    PointHandle *hoveredHandle = nullptr;
+
+    QTransform transform;
+    if (event)
+        transform = viewTransform(event);
+    else if (QGraphicsView *view = mapScene()->views().first())
+        transform = view->transform();
+
+    QGraphicsItem *hoveredItem = mapScene()->itemAt(scenePos, transform);
+    hoveredHandle = qgraphicsitem_cast<PointHandle*>(hoveredItem);
+
+    setHoveredHandle(hoveredHandle);
+}
+
+void CreatePolygonObjectTool::updateHandles()
+{
+    qDeleteAll(mHandles);
+    mHandles.clear();
+
+    mHoveredHandle = nullptr;
+    mClickedHandle = nullptr;
+
+    MapRenderer *renderer = mapDocument()->renderer();
+    MapObject *currentObject = mNewMapObjectItem ? mNewMapObjectItem->mapObject() : nullptr;
+
+    auto createHandles = [=] (MapObject *object) {
+        if (object->shape() != MapObject::Polyline)
+            return;
+
+        const QPolygonF &polygon = object->polygon();
+        if (polygon.size() < 2)
+            return;
+
+        QPointF objectScreenPos = renderer->pixelToScreenCoords(object->position());
+        QTransform rotate = rotateAt(objectScreenPos, object->rotation());
+        QPointF totalOffset = object->objectGroup()->totalOffset();
+
+        auto createHandle = [&](int pointIndex) {
+            PointHandle *handle = new PointHandle(object, pointIndex);
+            mHandles.append(handle);
+
+            QPointF pixelPos = polygon.at(pointIndex) + object->position();
+            QPointF screenPos = renderer->pixelToScreenCoords(pixelPos);
+            screenPos = rotate.map(screenPos);
+            handle->setPos(totalOffset + screenPos);
+
+            mapScene()->addItem(handle);
+        };
+
+        // Create a handle for the start and for the end point
+        if (object != currentObject || (polygon.size() > 2 && mMode != ExtendingAtBegin))
+            createHandle(0);
+        if (object != currentObject || (polygon.size() > 2 && mMode == ExtendingAtBegin))
+            createHandle(polygon.size() - 1);
+    };
+
+    const QList<MapObject*> &selection = mapDocument()->selectedObjects();
+    for (MapObject *object : selection)
+        createHandles(object);
+    if (mNewMapObjectItem && !selection.contains(mNewMapObjectItem->mapObject()))
+        createHandles(mNewMapObjectItem->mapObject());
+}
+
+void CreatePolygonObjectTool::objectsChanged(const QList<MapObject *> &objects)
+{
+    // Possibly the polygon of the object being extended changed
+    if (mNewMapObjectItem && objects.contains(mNewMapObjectItem->mapObject()))
+        synchronizeOverlayObject();
+
+    updateHandles();
+}
+
+void CreatePolygonObjectTool::objectsRemoved(const QList<MapObject *> &objects)
+{
+    // Check whether the object being extended was removed
+    // todo: Check case of deleting object group / group layer
+    if (mNewMapObjectItem && objects.contains(mNewMapObjectItem->mapObject()))
+        abortExtendingMapObject();
+
+    for (int i = mHandles.size() - 1; i > 0; --i) {
+        PointHandle *handle = mHandles.at(i);
+
+        if (objects.contains(handle->mapObject())) {
+            delete handle;
+            mHandles.removeAt(i);
+
+            if (mHoveredHandle == handle)
+                mHoveredHandle = nullptr;
+            if (mClickedHandle == handle)
+                mClickedHandle = nullptr;
+        }
+    }
+}
+
+void CreatePolygonObjectTool::finishExtendingMapObject()
+{
+    if (mFinishAsPolygon) {
+        auto command = new ChangeMapObject(mapDocument(),
+                                           mNewMapObjectItem->mapObject(),
+                                           MapObject::ShapeProperty,
+                                           QVariant::fromValue(MapObject::Polygon));
+        command->setText(tr("Create Polygon"));
+        mapDocument()->undoStack()->push(command);
+    }
+
+    abortExtendingMapObject();
+}
+
+void CreatePolygonObjectTool::abortExtendingMapObject()
+{
+    mMode = NoMode;
+    mFinishAsPolygon = false;
+
+    delete mNewMapObjectItem;
+    mNewMapObjectItem = nullptr;
+
+    delete mOverlayPolygonItem;
+    mOverlayPolygonItem = nullptr;
+
+    updateHandles();
+}
+
+void CreatePolygonObjectTool::synchronizeOverlayObject()
+{
+    Q_ASSERT(mNewMapObjectItem);
+
+    MapObject *mapObject = mNewMapObjectItem->mapObject();
+    QPolygonF polygon = mapObject->polygon();
+
+    // Add the point that is connected to the mouse
+    if (mMode == ExtendingAtBegin)
+        polygon.prepend(mLastPixelPos - mapObject->position());
     else
-        CreateMultipointObjectTool::cancelNewMapObject();
+        polygon.append(mLastPixelPos - mapObject->position());
+
+    mOverlayPolygonObject->setPolygon(polygon);
+    mOverlayPolygonObject->setShape(mapObject->shape());
+    mOverlayPolygonObject->setPosition(mapObject->position());
+
+    if (mOverlayPolygonItem)
+        mOverlayPolygonItem->syncWithMapObject();
+}
+
+bool CreatePolygonObjectTool::startNewMapObject(const QPointF &pos, ObjectGroup *objectGroup)
+{
+    if (!objectGroup->isUnlocked())
+        return false;
+
+    CreateObjectTool::startNewMapObject(pos, objectGroup);
+    MapObject *newMapObject = mNewMapObjectItem->mapObject();
+    QPolygonF polygon;
+    polygon.append(QPointF());
+    newMapObject->setPolygon(polygon);
+
+    mLastPixelPos = pos;
+    synchronizeOverlayObject();
+
+    mOverlayPolygonItem = new MapObjectItem(mOverlayPolygonObject,
+                                            mapDocument(),
+                                            mObjectGroupItem);
+
+    mMode = Creating;
+
+    return true;
+}
+
+/**
+ * Starts extending the given polyline \a mapObject.
+ *
+ * \a extendingFirst determines whether it should extend from the first or
+ * the last point of the polyline.
+ */
+void CreatePolygonObjectTool::extend(MapObject *mapObject, bool extendingFirst)
+{
+    Q_ASSERT(mapObject->shape() == MapObject::Polyline);
+
+    mMode = extendingFirst ? ExtendingAtBegin : ExtendingAtEnd;
+
+    mNewMapObjectItem = new MapObjectItem(mapObject, mapDocument(), mObjectGroupItem);
+
+    const QPolygonF &polygon = mapObject->polygon();
+    mLastPixelPos = (extendingFirst ? polygon.first() : polygon.last()) + mapObject->position();
+
+    synchronizeOverlayObject();
+
+    mOverlayPolygonItem = new MapObjectItem(mOverlayPolygonObject,
+                                            mapDocument(),
+                                            mObjectGroupItem);
+
+    updateHandles();
+}
+
+void CreatePolygonObjectTool::setHoveredHandle(PointHandle *handle)
+{
+    if (mHoveredHandle)
+        mHoveredHandle->setHighlighted(false);
+
+    mHoveredHandle = handle;
+
+    if (handle)
+        handle->setHighlighted(true);
 }
