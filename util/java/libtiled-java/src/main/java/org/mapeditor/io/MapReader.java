@@ -33,6 +33,7 @@ package org.mapeditor.io;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.net.URL;
 import java.util.List;
 import java.util.logging.Level;
@@ -67,7 +68,7 @@ public class MapReader {
      * @return a {@link org.mapeditor.core.Map} object.
      * @throws java.io.IOException if any.
      */
-    public Map readMap(InputStream in, String xmlPath) throws IOException {
+    public Map readMap(InputStream in, URL xmlPath) throws IOException {
         Map unmarshalledMap = unmarshal(in, Map.class);
         return buildMap(unmarshalledMap, xmlPath);
     }
@@ -81,12 +82,11 @@ public class MapReader {
      */
     public Map readMap(String filename) throws IOException {
         int fileSeparatorIndex = filename.lastIndexOf(File.separatorChar) + 1;
-        String xmlPath = makeUrl(filename.substring(0, fileSeparatorIndex));
+        URL xmlPath = FileResolver.makeUrl(filename.substring(0, fileSeparatorIndex));
 
-        String xmlFile = makeUrl(filename);
+        URL xmlFile = FileResolver.makeUrl(filename);
 
-        URL url = new URL(xmlFile);
-        InputStream is = url.openStream();
+        InputStream is = xmlFile.openStream();
 
         // Wrap with GZIP decoder for .tmx.gz files
         if (filename.endsWith(".gz")) {
@@ -99,11 +99,11 @@ public class MapReader {
     /**
      * <p>readTileset.</p>
      *
-     * @param in a {@link java.io.InputStream} object.
+     * @param url a {@link java.io.InputStream} object.
      * @return a {@link org.mapeditor.core.TileSet} object.
      */
-    public TileSet readTileset(InputStream in) {
-        return unmarshal(in, TileSet.class);
+    public TileSet readTileset(InputStream url) {
+        return unmarshal(url, TileSet.class);
     }
 
     /**
@@ -114,35 +114,24 @@ public class MapReader {
      * @throws java.io.IOException if any.
      */
     public TileSet readTileset(String filename) throws IOException {
-        String xmlFile = makeUrl(filename);
-        URL url = new URL(xmlFile);
+        URL url = FileResolver.makeUrl(filename);
         return readTileset(url.openStream());
     }
 
-    private Map buildMap(Map map, String xmlPath) throws IOException {
+    private Map buildMap(Map map, URL xmlPath) throws IOException {
         List<TileSet> tilesets = map.getTileSets();
         for (int i = 0; i < tilesets.size(); i++) {
             TileSet tileset = tilesets.get(i);
             String tileSetSource = tileset.getSource();
             if (tileSetSource != null) {
                 int firstGid = tileset.getFirstgid();
-                tileset = readTileset(xmlPath + tileSetSource);
+                tileset = readTileset(new URL(xmlPath, tileSetSource).openStream());
                 tileset.setFirstgid(firstGid);
                 tileset.setSource(tileSetSource);
                 tilesets.set(i, tileset);
             }
         }
         return map;
-    }
-
-    private String makeUrl(String filename) {
-        final String url;
-        if (filename.indexOf("://") > 0 || filename.startsWith("file:")) {
-            url = filename;
-        } else {
-            url = new File(filename).toURI().toString();
-        }
-        return url;
     }
 
     private <T> T unmarshal(InputStream in, Class<T> type) {
