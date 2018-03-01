@@ -37,6 +37,7 @@ import java.awt.image.BufferedImage;
 import java.awt.image.FilteredImageSource;
 import java.io.File;
 import java.io.IOException;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
@@ -102,7 +103,7 @@ public class TileSet extends TileSetData implements Iterable<Tile> {
             throws IOException {
         setTilesetImageFilename(imgFilename);
 
-        Image image = ImageIO.read(new File(imgFilename));
+        Image image = ImageIO.read(new URL(imgFilename).openStream());
         if (image == null) {
             throw new IOException("Failed to load " + tilebmpFile);
         }
