@@ -39,6 +39,8 @@
 #include <QSet>
 #include <QUndoStack>
 
+#include "qtcompat_p.h"
+
 static const char * const TMX_MIMETYPE = "text/tmx";
 
 using namespace Tiled;
@@ -145,6 +147,9 @@ bool ClipboardManager::copySelection(const MapDocument &mapDocument)
                 map->tileWidth(), map->tileHeight());
     copyMap.setRenderOrder(map->renderOrder());
 
+    QList<MapObject*> copiedObjects;
+    copiedObjects.reserve(selectedObjects.size());
+
     LayerIterator layerIterator(map);
     while (Layer *layer = layerIterator.next()) {
         switch (layer->layerType()) {
@@ -165,17 +170,24 @@ bool ClipboardManager::copySelection(const MapDocument &mapDocument)
             copyMap.addLayer(copyLayer);
             break;
         }
-        case Layer::ObjectGroupType: // todo: maybe it makes to group selected objects by layer
+        case Layer::ObjectGroupType:
+            // This makes sure the copied objects retain their order
+            // todo: consider grouping selected objects by layer
+            for (MapObject *mapObject : *static_cast<const ObjectGroup*>(layer)) {
+                if (selectedObjects.contains(mapObject))
+                    copiedObjects.append(mapObject);
+            }
+            break;
         case Layer::ImageLayerType:
         case Layer::GroupLayerType:
             break;  // nothing to do
         }
     }
 
-    if (!selectedObjects.isEmpty()) {
+    if (!copiedObjects.isEmpty()) {
         // Create a new object group with clones of the selected objects
         ObjectGroup *objectGroup = new ObjectGroup;
-        for (const MapObject *mapObject : selectedObjects)
+        for (const MapObject *mapObject : qAsConst(copiedObjects))
             objectGroup->addObject(mapObject->clone());
         copyMap.addLayer(objectGroup);
     }

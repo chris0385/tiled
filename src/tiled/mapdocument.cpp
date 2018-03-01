@@ -782,6 +782,26 @@ void MapDocument::setSelectedArea(const QRegion &selection)
     }
 }
 
+/**
+ * Returns the list of selected objects, in their display order (when
+ * ObjectGroup::IndexOrder is used).
+ */
+QList<MapObject *> MapDocument::selectedObjectsOrdered() const
+{
+    QList<MapObject*> objects;
+    objects.reserve(mSelectedObjects.size());
+
+    LayerIterator it(mMap, Layer::ObjectGroupType);
+    while (ObjectGroup *objectGroup = static_cast<ObjectGroup*>(it.next())) {
+        for (MapObject *mapObject : objectGroup->objects()) {
+            if (mSelectedObjects.contains(mapObject))
+                objects.append(mapObject);
+        }
+    }
+
+    return objects;
+}
+
 void MapDocument::setSelectedObjects(const QList<MapObject *> &selectedObjects)
 {
     mSelectedObjects = selectedObjects;
@@ -1117,8 +1137,19 @@ void MapDocument::moveObjectsToGroup(const QList<MapObject *> &objects,
     mUndoStack->beginMacro(tr("Move %n Object(s) to Layer", "",
                               objects.size()));
 
-    const auto objectsCopy = objects;   // original list may get modified
-    for (MapObject *mapObject : objectsCopy) {
+    QList<MapObject*> objectsToMove;
+    objectsToMove.reserve(objects.size());
+
+    // This makes sure the copied objects retain their order
+    LayerIterator it(mMap, Layer::ObjectGroupType);
+    while (ObjectGroup *objectGroup = static_cast<ObjectGroup*>(it.next())) {
+        for (MapObject *mapObject : objectGroup->objects()) {
+            if (objects.contains(mapObject))
+                objectsToMove.append(mapObject);
+        }
+    }
+
+    for (MapObject *mapObject : qAsConst(objectsToMove)) {
         if (mapObject->objectGroup() == objectGroup)
             continue;
 
